@@ -22,6 +22,7 @@ union Vec3 {
   };
 };
 
+
 struct Quat {
   float w;
   float x;
