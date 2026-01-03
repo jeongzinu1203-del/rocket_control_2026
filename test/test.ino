@@ -15,7 +15,6 @@ const int SERVO_OPEN_US = 2000;
 const int SERVO_PIN = 25;
 
 enum RocketState { STATE_GROUND, STATE_ASCENT, STATE_DESCENT };
-RocketState currentState = STATE_GROUND;
 
 union Vec3 {
   struct { float x; float y; float z; };
@@ -30,6 +29,7 @@ static const int SD_CS = 13;
 static const int SD_MOSI = 23;
 static const float seaLevelPressure = 1013.25f;
 
+RocketState currentState = STATE_GROUND;
 Adafruit_BMP3XX bmp;
 Adafruit_BNO08x bno08x(-1);
 Servo servo;
@@ -59,31 +59,51 @@ static inline Quat QuatNormalize(Quat q);
 void setup() {
   Serial.begin(115200);
   while (!Serial);
+
   Wire.begin(21, 22);
   ScanI2C();
 
-  servo.attach(SERVO_PIN);
-  servo.writeMicroseconds(SERVO_LOCKED_US);
-
-  while (!bmp.begin_I2C()) { delay(1000); }
-  bmp.setTemperatureOversampling(BMP3_NO_OVERSAMPLING);
+  // BMP390
+  while (!bmp.begin_I2C()) {
+    Serial.println("Conncecting BMP390...");
+    delay(1000);
+  }
+  Serial.println("BMP390 Connected!");
+  bmp.setTemperatureOversampling(BMP3_OVERSAMPLING_8X);
   bmp.setPressureOversampling(BMP3_OVERSAMPLING_4X);
   bmp.setIIRFilterCoeff(BMP3_IIR_FILTER_COEFF_3);
   bmp.setOutputDataRate(BMP3_ODR_50_HZ);
   delay(500);
 
   float totalAlt = 0;
-  for(int i = 0; i < 20; i++) {
-    if(bmp.performReading()) totalAlt += bmp.readAltitude(seaLevelPressure);
+  for(int i = 0; i < 10; i++) {
+    if(bmp.performReading()) {
+      totalAlt += bmp.readAltitude(seaLevelPressure);
+    }
     delay(50);
   }
-  groundAltitude = totalAlt / 20.0;
+  groundAltitude = totalAlt / 10.0;
+  Serial.print("Ground Alt: "); Serial.print(groundAltitude); Serial.println(" m");
 
-  if (bno08x.begin_I2C(0x4B) || bno08x.begin_I2C(0x4A)) {
+  // BNO08x
+  Serial.println("Connecting to BNO08x...");
+  if (bno08x.begin_I2C(0x4B)) {
+    Serial.println("[BNO08x] Connected at 0x4B!");
     setReports();
     bnoOK = true;
+  } else if (bno08x.begin_I2C(0x4A)) {
+    Serial.println("[BNO08x] Connected at 0x4A!");
+    setReports();
+    bnoOK = true;
+  } else {
+    Serial.println("[WARNING] BNO08x Not Found via library.");
+    return;
   }
 
+  // Servo
+  servo.attach(servoPin);
+
+  // SD
   InitSD();
 }
 
@@ -107,7 +127,7 @@ void loop() {
         maxAltitude = currentAlt;
       }
 
-      // [핵심 로직] 최고 고도 대비 2m 하강 감지 시 사출
+      // 최고 고도 대비 2m 하강 감지 시 사출
       if (currentAlt < (maxAltitude - APOGEE_DROP_THRESHOLD)) {
         servo.writeMicroseconds(SERVO_OPEN_US);
         isParachuteDeployed = true;
@@ -120,7 +140,24 @@ void loop() {
   }
 
   LogCSV(currentAlt, isParachuteDeployed);
-  delay(20);
+
+  Serial.print("Altitude: "); Serial.println(altitude);
+  Serial.print("Local Acc: ");
+  Serial.print(latestAcc.x); Serial.print(", ");
+  Serial.print(latestAcc.y); Serial.print(", ");
+  Serial.print(latestAcc.z); Serial.println();
+  Serial.print("World Acc: ");
+  Serial.print(worldAcc.x); Serial.print(", ");
+  Serial.print(worldAcc.y); Serial.print(", ");
+  Serial.print(worldAcc.z); Serial.println();
+  Serial.print("Pose: ");
+  Serial.print(latestPose.roll); Serial.print(", ");
+  Serial.print(latestPose.pitch); Serial.print(", ");
+  Serial.print(latestPose.yaw); Serial.println();
+
+  Serial.println();
+
+  delay(100);
 }
 
 float GetAltitude() {
@@ -191,26 +228,43 @@ void PollBNO() {
 
 void InitSD() {
   SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  if (!SD.begin(SD_CS, SPI)) { sdOK = false; return; }
+
+  Serial.println("Connecting microSD...");
+  if (!SD.begin(SD_CS, SPI)) {
+    Serial.println("[SD] Mount failed. Check wiring / CS pin / card format(FAT32).");
+    sdOK = false;
+    return;
+  }
   sdOK = true;
+  Serial.println("[SD] OK!");
+
   const String logName = "/log_";
   int digit = 0;
-  fileName = logName + String(digit) + ".csv";
+  const String ext = ".csv";
+  fileName = logName + String(digit) + ext;
+
   while (SD.exists(fileName)) {
     ++digit;
-    fileName = logName + String(digit) + ".csv";
+    fileName = logName + String(digit) + ext;
   }
+
   File f = SD.open(fileName, FILE_WRITE);
   if (f) {
-    f.println("ms,alt_m,acc_x,acc_y,acc_z,roll,pitch,yaw,servo_on");
+    f.println("ms,alt_m,acc_x,acc_y,acc_z,roll_deg,pitch_deg,yaw_deg,servo_on");
     f.close();
+    Serial.println("[SD] log.csv header created.");
+  } else {
+    Serial.println("[SD] Failed to create log.csv");
   }
 }
 
 void LogCSV(float altitude, bool servoOn) {
-  if (!sdOK) return;
   File f = SD.open(fileName, FILE_APPEND);
-  if (!f) return;
+  if (!f) {
+    Serial.println("[SD] open failed");
+    return;
+  }
+
   f.print(millis()); f.print(",");
   f.print(altitude); f.print(",");
   f.print(latestAcc.x); f.print(",");
@@ -220,7 +274,10 @@ void LogCSV(float altitude, bool servoOn) {
   f.print(latestPose.pitch); f.print(",");
   f.print(latestPose.yaw); f.print(",");
   f.println(servoOn ? 1 : 0);
+
   f.close();
+
+  Serial.println("SD Saved!");
 }
 
 Vec3 RotateLocalToWorld(Quat q, const Vec3& v) {
